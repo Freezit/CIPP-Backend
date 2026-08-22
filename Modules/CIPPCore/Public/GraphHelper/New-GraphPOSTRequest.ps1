@@ -19,6 +19,7 @@ function New-GraphPOSTRequest {
         $returnHeaders = $false,
         $maxRetries = 3,
         $ScheduleRetry = $false,
+        [switch]$UseCertificate,
         $headers
     )
 
@@ -26,7 +27,9 @@ function New-GraphPOSTRequest {
         if ($Headers) {
             $Headers = $Headers
         } else {
-            $Headers = Get-GraphToken -tenantid $tenantid -scope $scope -AsApp $asapp -SkipCache $skipTokenCache
+            # -UseCertificate authenticates the app with the SAM certificate instead of the
+            # client secret: delegated (refresh token) by default, app-only with -AsApp $true
+            $Headers = Get-GraphToken -tenantid $tenantid -scope $scope -AsApp $asapp -SkipCache $skipTokenCache -UseCertificate:$UseCertificate
         }
         if ($AddedHeaders) {
             foreach ($header in $AddedHeaders.GetEnumerator()) {
@@ -118,6 +121,7 @@ function New-GraphPOSTRequest {
                 if ($IgnoreErrors) { $RetryParameters.IgnoreErrors = $IgnoreErrors }
                 if ($returnHeaders) { $RetryParameters.ReturnHeaders = $returnHeaders }
                 if ($maxRetries) { $RetryParameters.maxRetries = $maxRetries }
+                if ($UseCertificate) { $RetryParameters.UseCertificate = $true }
 
                 # Create the scheduled task object
                 $TaskObject = [PSCustomObject]@{
@@ -155,6 +159,6 @@ function New-GraphPOSTRequest {
             return $ReturnedData
         }
     } else {
-        Write-Error 'Not allowed. You cannot manage your own tenant or tenants not under your scope'
+        Write-Error (Get-AuthorisedRequestError -TenantID $tenantid -Context 'Graph request')
     }
 }
