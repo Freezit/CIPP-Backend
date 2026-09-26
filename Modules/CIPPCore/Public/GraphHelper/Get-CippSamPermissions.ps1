@@ -12,11 +12,12 @@ function Get-CippSamPermissions {
     The effective set returned in .Permissions is therefore always manifest ∪ extras. Each permission
     is annotated with a 'required' boolean so the UI can lock the manifest-defined defaults.
 
-    Unless -NoDiff is used, the function also reads what is actually granted on the CIPP-SAM enterprise
-    application (service principal) in the partner tenant - appRoleAssignments (application/Role) and
-    oauth2PermissionGrants (delegated/Scope) - and diffs those grants against the effective set,
+    Unless -NoDiff is used, the function reads what is actually granted on the CIPP-SAM enterprise
+    application (service principal) in the partner tenant: appRoleAssignments (application/Role) and
+    oauth2PermissionGrants (delegated/Scope). It diffs those grants against the effective set,
     surfacing permissions that need to be granted (MissingPermissions) and grants that are present but
     not in the effective set (PartnerAppDiff). The app registration's requiredResourceAccess is not used.
+    If the grant lookup fails, GrantCheckFailed is set to $true and GrantCheckError contains the error message.
 
     .EXAMPLE
     Get-CippSamPermissions
@@ -206,6 +207,8 @@ function Get-CippSamPermissions {
     # PartnerAppDiff also surfaces extra grants on the SP that are not in the effective set.
     $MissingPermissions = @{}
     $PartnerAppDiff = @{}
+    $GrantCheckFailed = $false
+    $GrantCheckError = ''
     if (!$NoDiff.IsPresent) {
         try {
             $PartnerSP = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/servicePrincipals(appId='$($env:ApplicationID)')?`$select=id" -tenantid $env:TenantID -NoAuthCheck $true
@@ -279,10 +282,36 @@ function Get-CippSamPermissions {
             }
         } catch {
             Write-Information "Failed to retrieve partner enterprise app grants for permission diff: $($_.Exception.Message)"
+            $GrantCheckFailed = $true
+            $GrantCheckError = $_.Exception.Message
         }
     }
 
-    $Timestamp = $SamManifestFile.LastWriteTime.ToUniversalTime()
+    # When the permission set last changed. Content hash, not mtime: git doesn't store mtimes,
+    # so every checkout/build restamped the manifest and re-queued the whole estate for CPV.
+    $ManifestContent = (Get-Content -Path $SamManifestFile.FullName -Raw) + (Get-Content -Path $AdditionalPermissionsFile.FullName -Raw)
+    $ManifestHash = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($ManifestContent)))
+    $HashRow = Get-CippAzDataTableEntity @Table -Filter "PartitionKey eq 'CIPP-SAM' and RowKey eq 'ManifestHash'"
+
+    if ($HashRow.Hash -eq $ManifestHash -and $HashRow.FirstSeenUtc) {
+        $Timestamp = ([datetime]::Parse($HashRow.FirstSeenUtc)).ToUniversalTime()
+    } else {
+        # New permission set - advance the timestamp once and record it.
+        $Timestamp = [datetime]::UtcNow
+        try {
+            $null = Add-CIPPAzDataTableEntity @Table -Force -Entity @{
+                PartitionKey = 'CIPP-SAM'
+                RowKey       = 'ManifestHash'
+                Hash         = $ManifestHash
+                FirstSeenUtc = $Timestamp.ToString('o')
+            }
+        } catch {
+            # Unpersisted, every call would look like first sight; mtime is at least stable.
+            Write-Information "Could not persist the SAM manifest hash: $($_.Exception.Message)"
+            $Timestamp = $SamManifestFile.LastWriteTime.ToUniversalTime()
+        }
+    }
+
     if ($SavedRow.Timestamp) {
         $SavedTimestamp = $SavedRow.Timestamp.DateTime.ToUniversalTime()
         if ($SavedTimestamp -gt $Timestamp) {
@@ -302,6 +331,8 @@ function Get-CippSamPermissions {
         Type                  = if ($HasSaved) { 'Table' } else { 'Manifest' }
         UpdatedBy             = $SavedRow.UpdatedBy ?? 'CIPP'
         Timestamp             = $Timestamp.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        GrantCheckFailed      = $GrantCheckFailed
+        GrantCheckError       = $GrantCheckError
     }
 
     $SamAppPermissions = $SamAppPermissions | ConvertTo-Json -Depth 10 -Compress | ConvertFrom-Json
